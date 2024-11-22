@@ -1,4 +1,4 @@
-This code is forked from https://github.com/transferwise/pipelinewise-target-snowflake which is now a deprecated repo. 
+This code is forked from https://github.com/transferwise/pipelinewise-target-snowflake which is now a deprecated repo as of August 2024.
 
 It has been modified to support the BATCH message type for jsonl-encoded, gzip-compressed BATCH messages.
 
@@ -10,7 +10,11 @@ The last version before this decision is [v0.64.1](https://github.com/transferwi
 
 We thank all in the open-source community, that over the past 6 years, have helped to make PipelineWise a robust product for heterogeneous replication of many many Terabytes, daily
 
-# pipelinewise-target-snowflake
+# target-snowflake
+
+This is a target-snowflake variant for the Meltano SDK. 
+
+Variant: russellromney
 
 [![PyPI version](https://badge.fury.io/py/pipelinewise-target-snowflake.svg)](https://badge.fury.io/py/pipelinewise-target-snowflake)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/pipelinewise-target-snowflake.svg)](https://pypi.org/project/pipelinewise-target-snowflake/)
@@ -18,7 +22,7 @@ We thank all in the open-source community, that over the past 6 years, have help
 
 [Singer](https://www.singer.io/) target that loads data into Snowflake following the [Singer spec](https://github.com/singer-io/getting-started/blob/master/docs/SPEC.md).
 
-This is a [PipelineWise](https://transferwise.github.io/pipelinewise) compatible target connector.
+This is a [PipelineWise](https://transferwise.github.io/pipelinewise) compatible target connector (at the time of deprecation).
 
 ## How to use it
 
