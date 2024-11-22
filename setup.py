@@ -27,6 +27,7 @@ setup(name="target-snowflake--russellromney",
           'inflection==0.5.1',
           'joblib==1.2.0',
           'boto3==1.28.20',
+          'numpy==1.26.4'
       ],
       extras_require={
           "test": [

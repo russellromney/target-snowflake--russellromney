@@ -263,8 +263,13 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                     filename = file.replace('file://','')[:-3]
                     with open(filename) as f:
                         for line in f:
-                            
-                            process_record({'stream':o['stream'],'record': json.loads(line),'time_extracted': datetime.now(timezone.utc)},v)
+                            process_record(
+                                {
+                                    'stream':o['stream'],'record': json.loads(line),
+                                    'time_extracted': datetime.now(timezone.utc).isoformat()
+                                },
+                                v
+                            )
             else: 
                 process_record(o,v)
         
