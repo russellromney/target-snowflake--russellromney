@@ -5,13 +5,13 @@ from setuptools import find_packages, setup
 with open('README.md') as f:
     long_description = f.read()
 
-setup(name="pipelinewise-target-snowflake",
+setup(name="target-snowflake--russellromney",
       version="2.3.0",
       description="Singer.io target for loading data to Snowflake - PipelineWise compatible",
       long_description=long_description,
       long_description_content_type='text/markdown',
       author="Wise",
-      url='https://github.com/transferwise/pipelinewise-target-snowflake',
+      url='https://github.com/russellromney/target-snowflake--russellromney',
       classifiers=[
           'License :: OSI Approved :: Apache Software License',
           'Programming Language :: Python :: 3 :: Only',
@@ -20,7 +20,7 @@ setup(name="pipelinewise-target-snowflake",
           'Programming Language :: Python :: 3.9',
       ],
       py_modules=["target_snowflake"],
-      python_requires='>=3.7',
+      python_requires='>=3.10',
       install_requires=[
           'pipelinewise-singer-python==1.*',
           'snowflake-connector-python[pandas]==3.0.4',
