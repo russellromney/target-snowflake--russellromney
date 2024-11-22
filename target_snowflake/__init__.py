@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
 import argparse
+import gzip
 import io
 import json
 import logging
 import os
+import subprocess
 import sys
 import copy
 
@@ -12,7 +14,7 @@ from typing import Dict, List, Optional
 from joblib import Parallel, delayed, parallel_backend
 from jsonschema import Draft7Validator, FormatChecker
 from singer import get_logger
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from target_snowflake.file_formats import csv
 from target_snowflake.file_formats import parquet
@@ -102,20 +104,119 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
     Returns:
         tuple of retrieved items: table_cache, file_format_type
     """
-    state = None
-    flushed_state = None
-    schemas = {}
-    key_properties = {}
-    validators = {}
-    records_to_load = {}
-    row_count = {}
-    stream_to_sync = {}
-    total_row_count = {}
-    batch_size_rows = config.get('batch_size_rows', DEFAULT_BATCH_SIZE_ROWS)
-    batch_wait_limit_seconds = config.get('batch_wait_limit_seconds', None)
-    flush_timestamp = datetime.utcnow()
-    archive_load_files = config.get('archive_load_files', False)
-    archive_load_files_data = {}
+    
+    class Vals():
+        state = None
+        flushed_state = None
+        schemas = {}
+        key_properties = {}
+        validators = {}
+        records_to_load = {}
+        row_count = {}
+        stream_to_sync = {}
+        total_row_count = {}
+        batch_size_rows = config.get('batch_size_rows', DEFAULT_BATCH_SIZE_ROWS)
+        batch_wait_limit_seconds = config.get('batch_wait_limit_seconds', None)
+        flush_timestamp = datetime.now(timezone.utc)
+        archive_load_files = config.get('archive_load_files', False)
+        archive_load_files_data = {}
+
+    v = Vals()
+
+    def process_record(o: dict, v: Vals) -> None:
+        """
+        Process a single record, reflecting changes in state back to the vals
+        """
+        if 'stream' not in o:
+            raise Exception(f"Line is missing required key 'stream': {line}")
+        if o['stream'] not in v.schemas:
+            raise Exception(
+                f"A record for stream {o['stream']} was encountered before a corresponding schema")
+
+        # Get schema for this record's stream
+        stream = o['stream']
+
+        stream_utils.adjust_timestamps_in_record(o['record'], v.schemas[stream])
+
+        # Validate record
+        if config.get('validate_records'):
+            try:
+                v.validators[stream].validate(stream_utils.float_to_decimal(o['record']))
+            except Exception as ex:
+                if type(ex).__name__ == "InvalidOperation":
+                    raise InvalidValidationOperationException(
+                        f"Data validation failed and cannot load to destination. RECORD: {o['record']}\n"
+                        "multipleOf validations that allows long precisions are not supported (i.e. with 15 digits"
+                        "or more) Try removing 'multipleOf' methods from JSON schema.") from ex
+                raise RecordValidationException(f"Record does not pass schema validation. RECORD: {o['record']}") \
+                    from ex
+
+        primary_key_string = v.stream_to_sync[stream].record_primary_key_string(o['record'])
+        if not primary_key_string:
+            primary_key_string = f'RID-{v.total_row_count[stream]}'
+
+        if stream not in v.records_to_load:
+            v.records_to_load[stream] = {}
+
+        # increment row count only when a new PK is encountered in the current batch
+        if primary_key_string not in v.records_to_load[stream]:
+            v.row_count[stream] += 1
+            v.total_row_count[stream] += 1
+
+        # append record
+        if config.get('add_metadata_columns') or config.get('hard_delete'):
+            v.records_to_load[stream][primary_key_string] = stream_utils.add_metadata_values_to_record(o)
+        else:
+            v.records_to_load[stream][primary_key_string] = o['record']
+
+        if v.archive_load_files and stream in v.archive_load_files_data:
+            # Keep track of min and max of the designated column
+            stream_archive_load_files_values = v.archive_load_files_data[stream]
+            if 'column' in stream_archive_load_files_values:
+                incremental_key_column_name = stream_archive_load_files_values['column']
+                incremental_key_value = o['record'][incremental_key_column_name]
+                min_value = stream_archive_load_files_values['min']
+                max_value = stream_archive_load_files_values['max']
+
+                if min_value is None or min_value > incremental_key_value:
+                    stream_archive_load_files_values['min'] = incremental_key_value
+
+                if max_value is None or max_value < incremental_key_value:
+                    stream_archive_load_files_values['max'] = incremental_key_value
+
+        flush = False
+        if v.row_count[stream] >= v.batch_size_rows:
+            flush = True
+            LOGGER.info("Flush triggered by batch_size_rows (%s) reached in %s",
+                        v.batch_size_rows, stream)
+        elif (v.batch_wait_limit_seconds and
+            datetime.now(timezone.utc) >= (v.flush_timestamp + timedelta(seconds=v.batch_wait_limit_seconds))):
+            flush = True
+            LOGGER.info("Flush triggered by batch_wait_limit_seconds (%s)",
+                        v.batch_wait_limit_seconds)
+
+        if flush:
+            # flush all streams, delete records if needed, reset counts and then emit current state
+            if config.get('flush_all_streams'):
+                filter_streams = None
+            else:
+                filter_streams = [stream]
+
+            # Flush and return a new state dict with new positions only for the flushed streams
+            v.flushed_state = flush_streams(
+                v.records_to_load,
+                v.row_count,
+                v.stream_to_sync,
+                config,
+                v.state,
+                v.flushed_state,
+                v.archive_load_files_data,
+                filter_streams=filter_streams)
+
+            v.flush_timestamp = datetime.now(timezone.utc)
+
+            # emit last encountered state
+            emit_state(copy.deepcopy(v.flushed_state))
 
     # Loop over lines from stdin
     for line in lines:
@@ -130,98 +231,43 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
 
         t = o['type']
 
-        if t == 'RECORD':
-            if 'stream' not in o:
-                raise Exception(f"Line is missing required key 'stream': {line}")
-            if o['stream'] not in schemas:
-                raise Exception(
-                    f"A record for stream {o['stream']} was encountered before a corresponding schema")
-
-            # Get schema for this record's stream
-            stream = o['stream']
-
-            stream_utils.adjust_timestamps_in_record(o['record'], schemas[stream])
-
-            # Validate record
-            if config.get('validate_records'):
-                try:
-                    validators[stream].validate(stream_utils.float_to_decimal(o['record']))
-                except Exception as ex:
-                    if type(ex).__name__ == "InvalidOperation":
-                        raise InvalidValidationOperationException(
-                            f"Data validation failed and cannot load to destination. RECORD: {o['record']}\n"
-                            "multipleOf validations that allows long precisions are not supported (i.e. with 15 digits"
-                            "or more) Try removing 'multipleOf' methods from JSON schema.") from ex
-                    raise RecordValidationException(f"Record does not pass schema validation. RECORD: {o['record']}") \
-                        from ex
-
-            primary_key_string = stream_to_sync[stream].record_primary_key_string(o['record'])
-            if not primary_key_string:
-                primary_key_string = f'RID-{total_row_count[stream]}'
-
-            if stream not in records_to_load:
-                records_to_load[stream] = {}
-
-            # increment row count only when a new PK is encountered in the current batch
-            if primary_key_string not in records_to_load[stream]:
-                row_count[stream] += 1
-                total_row_count[stream] += 1
-
-            # append record
-            if config.get('add_metadata_columns') or config.get('hard_delete'):
-                records_to_load[stream][primary_key_string] = stream_utils.add_metadata_values_to_record(o)
-            else:
-                records_to_load[stream][primary_key_string] = o['record']
-
-            if archive_load_files and stream in archive_load_files_data:
-                # Keep track of min and max of the designated column
-                stream_archive_load_files_values = archive_load_files_data[stream]
-                if 'column' in stream_archive_load_files_values:
-                    incremental_key_column_name = stream_archive_load_files_values['column']
-                    incremental_key_value = o['record'][incremental_key_column_name]
-                    min_value = stream_archive_load_files_values['min']
-                    max_value = stream_archive_load_files_values['max']
-
-                    if min_value is None or min_value > incremental_key_value:
-                        stream_archive_load_files_values['min'] = incremental_key_value
-
-                    if max_value is None or max_value < incremental_key_value:
-                        stream_archive_load_files_values['max'] = incremental_key_value
-
-            flush = False
-            if row_count[stream] >= batch_size_rows:
-                flush = True
-                LOGGER.info("Flush triggered by batch_size_rows (%s) reached in %s",
-                            batch_size_rows, stream)
-            elif (batch_wait_limit_seconds and
-                  datetime.utcnow() >= (flush_timestamp + timedelta(seconds=batch_wait_limit_seconds))):
-                flush = True
-                LOGGER.info("Flush triggered by batch_wait_limit_seconds (%s)",
-                            batch_wait_limit_seconds)
-
-            if flush:
-                # flush all streams, delete records if needed, reset counts and then emit current state
-                if config.get('flush_all_streams'):
-                    filter_streams = None
-                else:
-                    filter_streams = [stream]
-
-                # Flush and return a new state dict with new positions only for the flushed streams
-                flushed_state = flush_streams(
-                    records_to_load,
-                    row_count,
-                    stream_to_sync,
-                    config,
-                    state,
-                    flushed_state,
-                    archive_load_files_data,
-                    filter_streams=filter_streams)
-
-                flush_timestamp = datetime.utcnow()
-
-                # emit last encountered state
-                emit_state(copy.deepcopy(flushed_state))
-
+        if t in ('RECORD','BATCH'):
+            if t == 'BATCH':
+                """
+                example of a batch message: 
+                    {
+                        "type": "BATCH",
+                        "stream": "users",
+                        "encoding": {
+                            "format": "jsonl",
+                            "compression": "gzip"
+                        },
+                        "manifest": [
+                            "file://path/to/batch/file/1",
+                            "file://path/to/batch/file/2"
+                        ]
+                    }
+                """
+                # loop over the lines of each JSONL FILE
+                # for each record, create a fake record and process it like a normal record
+                # only allowed file type is 'jsonl'
+                # only allowed compression is 'gzip'
+                assert o['encoding']['format'] == 'jsonl', f"BATCH encoding format must be 'jsonl', not {o['encoding']['format']}; RECORD: {o}"
+                assert o['encoding']['compression'] == 'gzip', f"BATCH encoding compression must be 'gzip', not {o['encoding']['compression']}; RECORD: {o}"
+                LOGGER.info(f"Received BATCH message: {o}")
+                for file in o['manifest']:
+                    LOGGER.info(f"Processing file from BATCH message: {file}")
+                    # gunzip the local file
+                    subprocess.run(['gunzip','-k',file.replace('file://','')])
+                    # drop .gz suffix
+                    filename = file.replace('file://','')[:-3]
+                    with open(filename) as f:
+                        for line in f:
+                            
+                            process_record({'stream':o['stream'],'record': json.loads(line),'time_extracted': datetime.now(timezone.utc)},v)
+            else: 
+                process_record(o,v)
+        
         elif t == 'SCHEMA':
             if 'stream' not in o:
                 raise Exception(f"Line is missing required key 'stream': {line}")
@@ -231,31 +277,31 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
 
             # Update and flush only if the the schema is new or different than
             # the previously used version of the schema
-            if stream not in schemas or schemas[stream] != new_schema:
+            if stream not in v.schemas or v.schemas[stream] != new_schema:
 
-                schemas[stream] = new_schema
-                validators[stream] = Draft7Validator(schemas[stream], format_checker=FormatChecker())
+                v.schemas[stream] = new_schema
+                v.validators[stream] = Draft7Validator(v.schemas[stream], format_checker=FormatChecker())
 
                 # flush records from previous stream SCHEMA
                 # if same stream has been encountered again, it means the schema might have been altered
                 # so previous records need to be flushed
-                if row_count.get(stream, 0) > 0:
+                if v.row_count.get(stream, 0) > 0:
                     # flush all streams, delete records if needed, reset counts and then emit current state
                     if config.get('flush_all_streams'):
                         filter_streams = None
                     else:
                         filter_streams = [stream]
-                    flushed_state = flush_streams(records_to_load,
-                                                  row_count,
-                                                  stream_to_sync,
+                    v.flushed_state = flush_streams(v.records_to_load,
+                                                  v.row_count,
+                                                  v.stream_to_sync,
                                                   config,
-                                                  state,
-                                                  flushed_state,
-                                                  archive_load_files_data,
+                                                  v.state,
+                                                  v.flushed_state,
+                                                  v.archive_load_files_data,
                                                   filter_streams=filter_streams)
 
                     # emit latest encountered state
-                    emit_state(flushed_state)
+                    emit_state(v.flushed_state)
 
                 # key_properties key must be available in the SCHEMA message.
                 if 'key_properties' not in o:
@@ -273,18 +319,18 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                     LOGGER.critical('Primary key is set to mandatory but not defined in the [%s] stream', stream)
                     raise Exception("key_properties field is required")
 
-                key_properties[stream] = o['key_properties']
+                v.key_properties[stream] = o['key_properties']
 
                 if config.get('add_metadata_columns') or config.get('hard_delete'):
-                    stream_to_sync[stream] = DbSync(config,
+                    v.stream_to_sync[stream] = DbSync(config,
                                                     add_metadata_columns_to_schema(o),
                                                     table_cache,
                                                     file_format_type)
                 else:
-                    stream_to_sync[stream] = DbSync(config, o, table_cache, file_format_type)
+                    v.stream_to_sync[stream] = DbSync(config, o, table_cache, file_format_type)
 
-                if archive_load_files:
-                    archive_load_files_data[stream] = {
+                if v.archive_load_files:
+                    v.archive_load_files_data[stream] = {
                         'tap': config.get('tap_id'),
                     }
 
@@ -293,7 +339,7 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                     incremental_key_column_name = stream_utils.get_incremental_key(o)
                     if incremental_key_column_name:
                         LOGGER.info("Using %s as incremental_key_column_name", incremental_key_column_name)
-                        archive_load_files_data[stream].update(
+                        v.archive_load_files_data[stream].update(
                             column=incremental_key_column_name,
                             min=None,
                             max=None
@@ -304,35 +350,35 @@ def persist_lines(config, lines, table_cache=None, file_format_type: FileFormatT
                             "Min/max values will not be added to metadata for stream %s.", stream
                         )
 
-                stream_to_sync[stream].create_schema_if_not_exists()
-                stream_to_sync[stream].sync_table()
+                v.stream_to_sync[stream].create_schema_if_not_exists()
+                v.stream_to_sync[stream].sync_table()
 
-                row_count[stream] = 0
-                total_row_count[stream] = 0
+                v.row_count[stream] = 0
+                v.total_row_count[stream] = 0
 
         elif t == 'ACTIVATE_VERSION':
             LOGGER.debug('ACTIVATE_VERSION message')
 
         elif t == 'STATE':
             LOGGER.debug('Setting state to %s', o['value'])
-            state = o['value']
+            v.state = o['value']
 
             # # set flushed state if it's not defined or there are no records so far
-            if not flushed_state or sum(row_count.values()) == 0:
-                flushed_state = copy.deepcopy(state)
+            if not v.flushed_state or sum(v.row_count.values()) == 0:
+                v.flushed_state = copy.deepcopy(v.state)
 
         else:
             raise Exception(f"Unknown message type {o['type']} in message {o}")
 
     # if some bucket has records that need to be flushed but haven't reached batch size
     # then flush all buckets.
-    if sum(row_count.values()) > 0:
+    if sum(v.row_count.values()) > 0:
         # flush all streams one last time, delete records if needed, reset counts and then emit current state
-        flushed_state = flush_streams(records_to_load, row_count, stream_to_sync, config, state, flushed_state,
-                                      archive_load_files_data)
+        v.flushed_state = flush_streams(v.records_to_load, v.row_count, v.stream_to_sync, config, v.state, v.flushed_state,
+                                      v.archive_load_files_data)
 
     # emit latest state
-    emit_state(copy.deepcopy(flushed_state))
+    emit_state(copy.deepcopy(v.flushed_state))
 
 
 # pylint: disable=too-many-arguments
